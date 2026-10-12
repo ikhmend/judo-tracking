@@ -36,6 +36,7 @@ class Person:
     white_fraction: float = 0.0
     blue_fraction: float = 0.0
     visual: tuple = ()
+    lower_blue_fraction: float = 0.0
 
 
 def crowded(person, detection_boxes):
@@ -90,7 +91,7 @@ class Target:
         self.reidentify_allowed = False
 
     def _reidentify(self, people, detection_boxes):
-        # A new ByteTrack ID needs position, size, gi appearance and three clear frames.
+        # The blue gi has a white back patch; require little blue on both torso and trousers.
         if not self.reidentify_allowed or not self.visual:
             return
         old = self.box
@@ -113,7 +114,8 @@ class Target:
                     and person.white_fraction >= 0.2
                     and person.white_fraction > person.blue_fraction + 0.15
                     and abs(person.white_fraction - self.white_fraction) <= 0.45
-                    and person.blue_fraction <= self.blue_fraction + 0.15):
+                    and person.blue_fraction <= min(0.15, self.blue_fraction + 0.15)
+                    and person.lower_blue_fraction <= 0.1):
                 candidates.append(person)
         if len(candidates) != 1:
             self.candidate_id, self.candidate_frames = None, 0
@@ -150,13 +152,22 @@ class Target:
             distance = hypot((old[0] + old[2] - person.box[0] - person.box[2]) / 2,
                              (old[1] + old[3] - person.box[1] - person.box[3]) / 2)
             scale = area(person.box) / area(old)
-            if (crowded(person, detection_boxes)
-                    and distance <= hypot(old[2] - old[0], old[3] - old[1])
-                    and 0.2 <= scale <= 5):
+            visual_match = (bool(self.visual and person.visual)
+                            and len(person.visual) == len(self.visual)
+                            and sum(a * b for a, b in zip(person.visual, self.visual)) >= 0.85)
+            overlap_continuity = (distance <= 0.5 * hypot(old[2] - old[0], old[3] - old[1])
+                                  and 0.5 <= scale <= 2
+                                  and person.confidence >= 0.5
+                                  and person.white_fraction >= 0.25
+                                  and person.white_fraction > person.blue_fraction + 0.15
+                                  and person.blue_fraction <= 0.15
+                                  and person.lower_blue_fraction <= 0.1
+                                  and visual_match)
+            if crowded(person, detection_boxes) and not overlap_continuity:
                 # An opponent's sleeve can temporarily contaminate the jersey crop.
                 if person.white_fraction >= 0.15 and person.white_fraction >= person.blue_fraction:
                     self.box = person.box
-                self.status, self.reason = 'uncertain', 'People overlap'
+                self.status, self.reason = 'uncertain', 'Overlapping boxes; identity ambiguous'
                 self.reidentify_allowed = True
                 self.clear_frames = 0
                 self.appearance_grace = 0
@@ -164,7 +175,11 @@ class Target:
                 return None
             max_distance = (0.75 if recovering else 0.5) * hypot(old[2] - old[0], old[3] - old[1])
             min_scale, max_scale = (0.25, 4) if recovering else (0.5, 2)
-            if distance > max_distance or not min_scale <= scale <= max_scale:
+            if person.blue_fraction >= 0.18 and person.blue_fraction >= person.white_fraction:
+                self.status, self.reason = 'uncertain', 'Blue-dominant or merged person box'
+            elif recovering and scale > 1.5 and person.white_fraction < 0.3:
+                self.status, self.reason = 'uncertain', 'Possible merged person box'
+            elif distance > max_distance or not min_scale <= scale <= max_scale:
                 self.status, self.reason = 'uncertain', 'Abrupt position or size change'
             elif (abs(person.white_fraction - self.white_fraction) > 0.35
                   or abs(person.blue_fraction - self.blue_fraction) > 0.2):

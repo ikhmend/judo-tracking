@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 import sys
 
-from target import Person, Target, crowded, csv_row, validate_box
+from target import Person, Target, area, crowded, csv_row, intersection, validate_box
 
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / '.target_selections.json'
@@ -66,6 +66,20 @@ def jersey_fractions(frame, box):
     blue = ((hsv[:, :, 0] > 90) & (hsv[:, :, 0] < 135)
             & (hsv[:, :, 1] > 70) & (hsv[:, :, 2] > 45))
     return float(white.mean()), float(blue.mean())
+
+
+def lower_blue_fraction(frame, box):
+    import cv2
+    x1, y1, x2, y2 = box
+    width, height = x2 - x1, y2 - y1
+    lower = frame[int(y1 + height * 0.62):int(y1 + height * 0.97),
+                  int(x1 + width * 0.18):int(x1 + width * 0.82)]
+    if not lower.size:
+        return 0.0
+    hsv = cv2.cvtColor(lower, cv2.COLOR_BGR2HSV)
+    blue = ((hsv[:, :, 0] > 90) & (hsv[:, :, 0] < 135)
+            & (hsv[:, :, 1] > 70) & (hsv[:, :, 2] > 45))
+    return float(blue.mean())
 
 
 def visual_descriptor(frame, box):
@@ -240,6 +254,55 @@ def prompt_selection(frame, people, boxes, output, index, target):
             print(exc)
 
 
+def debug_observation(frame, detections, people, target):
+    if target.box is None:
+        return 'unselected'
+    nearby = []
+    mat_people = 0
+    for box, confidence in zip(detections.xyxy, detections.confidence):
+        if (confidence >= 0.35 and area(box) >= 0.035 * frame.shape[0] * frame.shape[1]
+                and box[3] >= 0.75 * frame.shape[0]):
+            mat_people += 1
+        if (confidence >= 0.35 and area(box) >= 0.4 * area(target.box)
+                and intersection(box, target.box) / min(area(box), area(target.box)) >= 0.2):
+            nearby.append(box)
+    if len(nearby) == 1 and mat_people == 1:
+        white, blue = jersey_fractions(frame, nearby[0])
+        if white >= 0.15 and blue >= 0.18:
+            return 'merged_box_suspected'
+    if target.status == 'tracking':
+        return 'confirmed'
+    if any(p.track_id == target.track_id for p in people):
+        return 'track_present_identity_ambiguous'
+    return 'nearby_detection_no_target_track' if nearby else 'no_detection_near_last_target'
+
+
+def draw_debug(frame, detections, people, target, observation):
+    import cv2
+    preview = frame.copy()
+    cv2.rectangle(preview, (0, 0), (min(preview.shape[1], 1000), 89), (0, 0, 0), -1)
+    cv2.putText(preview, f'target {target.target_id} / track {target.track_id} / {target.status}',
+                (8, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    cv2.putText(preview, target.reason, (8, 52),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    cv2.putText(preview, observation, (8, 78),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    for box, confidence in zip(detections.xyxy, detections.confidence):
+        x1, y1, x2, y2 = (int(v) for v in box)
+        cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 165, 255), 1)
+        cv2.putText(preview, f'det {confidence:.2f}', (x1, max(y1 - 20, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 165, 255), 1)
+    for person in people:
+        x1, y1, x2, y2 = (int(v) for v in person.box)
+        cv2.rectangle(preview, (x1, y1), (x2, y2), (255, 220, 0), 1)
+        cv2.putText(preview, f'track {person.track_id}', (x1, max(y1 - 5, 28)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 220, 0), 2)
+    if target.status == 'tracking' and target.box is not None:
+        x1, y1, x2, y2 = (int(v) for v in target.box)
+        cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 220, 0), 3)
+    return preview
+
+
 def run(args):
     import cv2
     if args.video is None or args.output is None:
@@ -260,10 +323,17 @@ def run(args):
     args.output.mkdir(parents=True, exist_ok=True)
     paths = [args.output / name for name in ('tracked.mp4', 'tracking.csv', 'events.csv')]
     selection_output = args.output / 'confirmed_selections.json'
-    if args.extract_frame is None and any(path.exists() for path in [*paths, selection_output]):
+    debug_paths = [(args.output / f'debug_{start:g}_{end:g}.mp4', start, end)
+                   for start, end in args.debug_range]
+    debug_csv = args.output / 'debug_frames.csv'
+    if args.extract_frame is None and any(path.exists() for path in
+                                          [*paths, selection_output, *[p for p, _, _ in debug_paths],
+                                           *([debug_csv] if debug_paths else [])]):
         raise ValueError('Output files already exist; use a fresh --output folder')
     capture = cv2.VideoCapture(str(args.video))
     writer = None
+    debug_writers = {}
+    debug_file = None
     try:
         if not capture.isOpened():
             raise ValueError('OpenCV could not open the MP4')
@@ -294,6 +364,12 @@ def run(args):
         index = 0
         used_selections = []
         first_selection_saved = cached is not None
+        if debug_paths:
+            debug_file = debug_csv.open('x', newline='')
+            debug_rows = csv.writer(debug_file)
+            debug_rows.writerow(['frame', 'timestamp', 'target_id', 'target_track_id',
+                                 'tracking_status', 'association_reason', 'observation',
+                                 'target_track_present', 'detections', 'tracks'])
         with paths[1].open('x', newline='') as csv_file, paths[2].open('x', newline='') as event_file:
             rows, events = csv.writer(csv_file), csv.writer(event_file)
             rows.writerow(['timestamp', 'target_id', 'x1', 'y1', 'x2', 'y2', 'tracking_status', 'track_id'])
@@ -321,7 +397,8 @@ def run(args):
                 boxes = athlete_boxes(frame, detections)
                 tracks = tracker.update_with_detections(detections)
                 people = [Person(int(track_id), tuple(float(v) for v in box), float(confidence),
-                                 *jersey_fractions(frame, box), visual_descriptor(frame, box))
+                                 *jersey_fractions(frame, box), visual_descriptor(frame, box),
+                                 lower_blue_fraction(frame, box))
                           for box, confidence, track_id in zip(tracks.xyxy, tracks.confidence, tracks.tracker_id)]
                 before = (target.status, target.track_id, target.reason)
                 box = target.update(people, boxes, cut)
@@ -360,6 +437,35 @@ def run(args):
                             update_selection_cache(args.video, index, box)
                             first_selection_saved = True
                 rows.writerow(csv_row(index / fps, target, box))
+                for path, start, end in debug_paths:
+                    if start <= index / fps < end:
+                        observation = debug_observation(frame, detections, people, target)
+                        target_present = any(p.track_id == target.track_id for p in people)
+                        if path not in debug_writers:
+                            debug_writers[path] = cv2.VideoWriter(
+                                str(path), cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                            if not debug_writers[path].isOpened():
+                                raise RuntimeError(f'Debug MP4 writer failed: {path}')
+                        debug_writers[path].write(draw_debug(frame, detections, people, target,
+                                                             observation))
+                        raw_debug = []
+                        for detected_box, confidence in zip(detections.xyxy, detections.confidence):
+                            white, blue = jersey_fractions(frame, detected_box)
+                            raw_debug.append({'box': [round(float(v), 2) for v in detected_box],
+                                              'confidence': round(float(confidence), 4),
+                                              'upper_white': round(white, 4),
+                                              'upper_blue': round(blue, 4),
+                                              'lower_blue': round(lower_blue_fraction(frame, detected_box), 4)})
+                        debug_rows.writerow([
+                            index, f'{index / fps:.6f}', target.target_id, target.track_id,
+                            target.status, target.reason, observation, target_present,
+                            json.dumps(raw_debug),
+                            json.dumps([{'id': p.track_id, 'box': [round(v, 2) for v in p.box],
+                                         'confidence': round(p.confidence, 4),
+                                         'upper_white': round(p.white_fraction, 4),
+                                         'upper_blue': round(p.blue_fraction, 4),
+                                         'lower_blue': round(p.lower_blue_fraction, 4)}
+                                        for p in people])])
                 if box is not None:
                     x1, y1, x2, y2 = (int(v) for v in box)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
@@ -384,6 +490,8 @@ def run(args):
             missed = set(selections) - {item['frame'] for item in used_selections}
             if missed:
                 raise ValueError(f'Selections were not reached: {sorted(missed)}')
+        if debug_file is not None:
+            debug_file.flush()
         with selection_output.open('x', encoding='utf-8') as handle:
             json.dump(used_selections, handle, indent=2)
         print(f'Done: {index} frames -> {args.output}')
@@ -393,6 +501,10 @@ def run(args):
         capture.release()
         if writer is not None:
             writer.release()
+        for debug_writer in debug_writers.values():
+            debug_writer.release()
+        if debug_file is not None:
+            debug_file.close()
 
 
 def main():
@@ -408,9 +520,17 @@ def main():
     parser.add_argument('--reset-selection', action='store_true', help='Forget saved initial target for this video')
     parser.add_argument('--interactive', action='store_true', help='Prompt for reselection after uncertainty')
     parser.add_argument('--extract-frame', type=int, help='Save a frame JPEG and exit; no model needed')
+    parser.add_argument('--debug-range', nargs=2, type=float, action='append', default=[],
+                        metavar=('START_SECONDS', 'END_SECONDS'),
+                        help='Write raw detection/tracker overlays and per-frame debug CSV for this interval')
     args = parser.parse_args()
     if args.start_frame < 0 or (args.extract_frame is not None and args.extract_frame < 0):
         parser.error('Frame indices must be nonnegative')
+    if any(not (math.isfinite(a) and math.isfinite(b) and 0 <= a < b)
+           for a, b in args.debug_range):
+        parser.error('Each --debug-range needs finite 0 <= start < end seconds')
+    if len({f'{a:g}_{b:g}' for a, b in args.debug_range}) != len(args.debug_range):
+        parser.error('Duplicate --debug-range intervals')
     try:
         if args.check_device:
             choose_device(args.device)

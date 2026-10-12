@@ -9,12 +9,14 @@ from unittest.mock import MagicMock, patch
 
 from target import Person, Target, csv_row, validate_box
 from track import (Detector, athlete_boxes, cached_selection, choose_device, clear_white_candidate,
+                   debug_observation, lower_blue_fraction,
                    load_selections, log_transition, prompt_selection, update_selection_cache)
 
 
 class TargetTests(unittest.TestCase):
     def setUp(self):
         self.white = Person(7, (10, 10, 50, 110), 0.9, 0.8, 0.0, (1.0, 0.0))
+        self.ambiguous_white = Person(7, self.white.box, 0.9, 0.4, 0.3, (0.0, 1.0))
         self.blue = Person(9, (150, 10, 190, 110), 0.9, 0.1)
         self.target = Target()
         self.target.select(self.white.box, [self.white, self.blue], [self.white.box, self.blue.box])
@@ -38,16 +40,35 @@ class TargetTests(unittest.TestCase):
 
     def test_overlap_with_an_untracked_person_recovers_same_id_after_clear_frames(self):
         other_box = (25, 10, 65, 110)
-        self.assertIsNone(self.target.update([self.white], [self.white.box, other_box]))
+        self.assertIsNone(self.target.update([self.ambiguous_white], [self.white.box, other_box]))
         self.assertEqual(self.target.status, 'uncertain')
         self.assertIsNone(self.target.update([self.white], [self.white.box]))
         self.assertIsNone(self.target.update([self.white], [self.white.box]))
         self.assertEqual(self.target.update([self.white], [self.white.box]), self.white.box)
         self.assertEqual(self.target.status, 'tracking')
 
+    def test_separate_overlapping_boxes_keep_a_visually_consistent_target(self):
+        opponent = (25, 10, 65, 110)
+        self.assertEqual(self.target.update([self.white], [self.white.box, opponent]), self.white.box)
+        self.assertEqual(self.target.status, 'tracking')
+
+    def test_overlapping_boxes_with_mixed_appearance_remain_uncertain(self):
+        opponent = (25, 10, 65, 110)
+        self.assertIsNone(self.target.update([self.ambiguous_white], [self.white.box, opponent]))
+        self.assertEqual(self.target.reason, 'Overlapping boxes; identity ambiguous')
+
+    def test_recovery_rejects_enlarged_mixed_person_box(self):
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
+        merged = Person(7, (10, 10, 74, 110), 0.9, 0.25, 0.1, (1.0, 0.0))
+        self.assertIsNone(self.target.update([merged], [merged.box]))
+        self.assertEqual(self.target.reason, 'Possible merged person box')
+        blue_dominant = Person(7, self.white.box, 0.9, 0.18, 0.24, (1.0, 0.0))
+        self.assertIsNone(self.target.update([blue_dominant], [blue_dominant.box]))
+        self.assertEqual(self.target.reason, 'Blue-dominant or merged person box')
+
     def test_overlap_reidentifies_new_id_only_after_three_clear_frames(self):
         other_box = (25, 10, 65, 110)
-        self.target.update([self.white], [self.white.box, other_box])
+        self.target.update([self.ambiguous_white], [self.white.box, other_box])
         replacement = Person(20, self.white.box, 0.9, 0.8, 0.0, (1.0, 0.0))
         self.assertIsNone(self.target.update([replacement], [replacement.box]))
         self.assertEqual((self.target.status, self.target.track_id), ('uncertain', 7))
@@ -57,7 +78,7 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(self.target.target_id, 1)
 
     def test_overlap_does_not_reidentify_blue_or_two_white_candidates(self):
-        self.target.update([self.white], [self.white.box, (25, 10, 65, 110)])
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
         blue = Person(20, self.white.box, 0.9, 0.1, 0.6)
         for _ in range(3):
             self.assertIsNone(self.target.update([blue], [blue.box]))
@@ -70,7 +91,7 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(self.target.track_id, 7)
 
     def test_new_id_requires_visual_match_and_motion(self):
-        self.target.update([self.white], [self.white.box, (25, 10, 65, 110)])
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
         wrong_texture = Person(20, self.white.box, 0.9, 0.8, 0.0, (0.0, 1.0))
         for _ in range(3):
             self.assertIsNone(self.target.update([wrong_texture], [wrong_texture.box]))
@@ -80,9 +101,16 @@ class TargetTests(unittest.TestCase):
             self.assertIsNone(self.target.update([far], [far.box]))
         self.assertEqual(self.target.track_id, 7)
 
+    def test_blue_athlete_with_white_back_patch_is_not_reidentified(self):
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
+        impostor = Person(20, self.white.box, 0.9, 0.44, 0.24, (1.0, 0.0), 0.16)
+        for _ in range(3):
+            self.assertIsNone(self.target.update([impostor], [impostor.box]))
+        self.assertEqual((self.target.track_id, self.target.status), (7, 'uncertain'))
+
     def test_new_id_must_follow_predicted_motion_not_just_be_nearby(self):
         self.target.velocity = (15.0, 0.0)
-        self.target.update([self.white], [self.white.box, (25, 10, 65, 110)])
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
         for _ in range(8):
             self.target.update([], [])
         stationary = Person(20, self.white.box, 0.9, 0.8, 0.0, (1.0, 0.0))
@@ -91,7 +119,7 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(self.target.track_id, 7)
 
     def test_track_change_and_recovery_events_keep_target_id(self):
-        self.target.update([self.white], [self.white.box, (25, 10, 65, 110)])
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
         new = Person(20, self.white.box, 0.9, 0.8, 0.0, (1.0, 0.0))
         self.target.update([new], [new.box])
         self.target.update([new], [new.box])
@@ -115,7 +143,7 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(row[:6], ['45', '1.500000', '1', '7', '7', 'lost'])
 
     def test_camera_cut_during_overlap_requires_user_selection(self):
-        self.target.update([self.white], [self.white.box, (25, 10, 65, 110)])
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
         self.assertIsNone(self.target.update([self.white], [self.white.box], camera_cut=True))
         self.assertEqual(self.target.reason, 'Possible camera cut')
         self.assertIsNone(self.target.update([self.white], [self.white.box]))
@@ -142,7 +170,7 @@ class TargetTests(unittest.TestCase):
                 self.assertEqual(self.target.status, 'uncertain')
 
     def test_overlap_allows_partial_box_then_recovers_only_original_id(self):
-        self.target.update([self.white], [self.white.box, (25, 10, 65, 110)])
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
         partial = Person(7, (20, 20, 40, 80), 0.8, 0.7, 0.02)
         self.assertIsNone(self.target.update([partial], [partial.box, (23, 20, 45, 80)]))
         complete = Person(7, (15, 12, 55, 112), 0.9, 0.75, 0.03)
@@ -151,18 +179,18 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(self.target.update([complete], [complete.box]), complete.box)
 
     def test_overlap_rejects_blue_appearance_even_with_same_id(self):
-        self.target.update([self.white], [self.white.box, (25, 10, 65, 110)])
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
         blue = Person(7, self.white.box, 0.9, 0.65, 0.5)
         for _ in range(6):
             self.assertIsNone(self.target.update([blue], [blue.box]))
         self.assertEqual(self.target.reason, 'Jersey appearance changed')
 
     def test_temporary_merged_jersey_recovers_after_three_clear_frames(self):
-        self.target.update([self.white], [self.white.box, (25, 10, 65, 110)])
+        self.target.update([self.ambiguous_white], [self.white.box, (25, 10, 65, 110)])
         merged = Person(7, self.white.box, 0.9, 0.4, 0.3)
         for _ in range(3):
             self.assertIsNone(self.target.update([merged], [merged.box]))
-        self.assertEqual(self.target.reason, 'People overlap')
+        self.assertEqual(self.target.reason, 'Overlapping boxes; identity ambiguous')
         for _ in range(2):
             self.assertIsNone(self.target.update([self.white], [self.white.box]))
         self.assertEqual(self.target.update([self.white], [self.white.box]), self.white.box)
@@ -171,7 +199,7 @@ class TargetTests(unittest.TestCase):
         contaminated = Person(7, self.white.box, 0.9, 0.4, 0.5)
         boxes = [self.white.box, (25, 10, 65, 110)]
         self.assertIsNone(self.target.update([contaminated], boxes))
-        self.assertEqual(self.target.reason, 'People overlap')
+        self.assertEqual(self.target.reason, 'Overlapping boxes; identity ambiguous')
         for _ in range(2):
             self.assertIsNone(self.target.update([self.white], [self.white.box]))
         self.assertEqual(self.target.update([self.white], [self.white.box]), self.white.box)
@@ -285,6 +313,27 @@ class DetectorTests(unittest.TestCase):
             with patch.dict('sys.modules', ultralytics=SimpleNamespace(YOLO=lambda *a, **k: model)):
                 detector = Detector(weights, 'cpu')
             self.assertEqual(len(detector.detect(None)), 0)
+
+    def test_debug_distinguishes_merged_box_from_separate_overlap(self):
+        import numpy as np
+        frame = np.zeros((120, 100, 3), dtype=np.uint8)
+        frame[:, :50] = (255, 255, 255)
+        frame[:, 50:] = (255, 0, 0)
+        target = Target()
+        person = Person(7, (10, 10, 50, 110), 0.9, 0.8, 0.0, (1.0, 0.0))
+        target.select(person.box, [person], [person.box])
+        target.status = 'uncertain'
+        merged = SimpleNamespace(xyxy=np.array([[0, 0, 100, 110]]), confidence=[0.9])
+        separate = SimpleNamespace(xyxy=np.array([[10, 10, 50, 110], [30, 10, 70, 110]]),
+                                   confidence=[0.9, 0.9])
+        self.assertEqual(debug_observation(frame, merged, [], target), 'merged_box_suspected')
+        self.assertEqual(debug_observation(frame, separate, [], target),
+                         'nearby_detection_no_target_track')
+        far_second_person = SimpleNamespace(
+            xyxy=np.array([[0, 0, 100, 110], [50, 10, 95, 110]]), confidence=[0.9, 0.9])
+        self.assertEqual(debug_observation(frame, far_second_person, [], target),
+                         'nearby_detection_no_target_track')
+        self.assertGreater(lower_blue_fraction(frame, (50, 10, 95, 110)), 0.9)
 
 class SelectionTests(unittest.TestCase):
     def test_first_selection_survives_new_run_and_can_be_reset(self):
