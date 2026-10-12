@@ -129,6 +129,7 @@ JSON-ийн сонголт бүр хүний баталсан сонголт б�
 | `events.csv` | `track_id_changed`, `lost`, `recovered`, `uncertain`, `selected` үйл явдал ба timestamp |
 | `confirmed_selections.json` | Хэрэглэгчийн баталсан сонголтууд |
 | `.target_selections.json` | Видеоны эхний сонголтын run хоорондын cache (төслийн үндсэн хавтас) |
+| `debug_<start>_<end>.mp4`, `debug_frames.csv` | `--debug-range` өгсөн үед raw person detection, confidence, бүх tracker ID, target-ийн шийдвэр |
 
 `tracking`, `lost`, `uncertain`, `unselected` төлөвтэй. `target_id=1` нь энэ видеонд хэрэглэгчийн сонгосон нэг тамирчны дугаар; ByteTrack-ийн түр `track_id` солигдсон ч хэвээр. `lost/uncertain` үед **box зурахгүй, CSV-ийн дөрвөн координат ба одоогийн track_id хоосон** байна. ID өөрчлөгдвөл хуучин/шинэ track ID-г `events.csv`-д тэмдэглэнэ.
 
@@ -140,9 +141,19 @@ timestamp,target_id,x1,y1,x2,y2,tracking_status,track_id
 
 Timestamp нь `frame_index / FPS`, нэгж нь секунд. Энэ хувилбар constant frame rate MP4 гэж үзнэ; variable frame rate видео бол эхлээд constant FPS болгон хөрвүүлнэ. Output MP4 нь original хэмжээ/FPS-тэй, **дуу агуулахгүй**. Алдаа эсвэл Ctrl+C үед writer/capture хаагдана, дутуу файлууд үлдэж болно; амжилтын `Done` гараагүй үр дүнг бүрэн гэж үзэхгүй.
 
+Барьц/мэхийн үеийг шалгахдаа секундын хоёр интервал өгнө:
+
+```bash
+python track.py --video /mnt/c/Users/Lenovo/Videos/match.mp4 \
+  --output outputs/debug_run --selections selections.match.reviewed.json \
+  --device cpu --debug-range 29 50 --debug-range 105 115
+```
+
+`debug_29_50.mp4`, `debug_105_115.mp4`-д улбар шар нимгэн box нь шүүлтээс өмнөх **бүх person detection** (`det` confidence), цэнхэр box нь tracker-ийн бүх ID, ногоон box нь зөвхөн батлагдсан target. `debug_frames.csv`-ийн мөр бүр raw detection/track box-уудыг JSON-аар, `association_reason`, `target_track_present`, `observation`-ийг хадгална. `merged_box_suspected` нь нэг том box-д цагаан/хөх шинж зэрэг илэрсэн **сэжиг**; хүний дүрсний шалгалтаар батална. Шинэ output хавтас хэрэглэнэ.
+
 ## Identity хамгаалах логик ба хязгаар
 
-Сонгосон track ID кадрт байхгүй бол эхлээд `uncertain`; 45 кадр батлагдахгүй өнгөрвөл `lost`. Өмсгөл харагдах confidence >= 0.35 person detection-уудын box давхцах (intersection / жижиг box area > 0.4), confidence сулрах, огцом байрлал/хэмжээ өөрчлөгдөх, өмсгөлийн шинж эсвэл grayscale дүрсний descriptor өөрчлөгдөх, camera cut-ийн дохио илрэхэд `uncertain`. Давхцалд tracker хараахан ID оноогоогүй хүмүүсийг ч шалгана. Confidence 0.1–0.35 detection-ууд ByteTrack-д хэвээр очно, гэхдээ сул duplicate/body-part detection-ийг өөр хүн гэж үзэхгүй. Давхцлын дараах шинэ ID-г зөвхөн өмнөх байрлал, хөдөлгөөний таамаг, хэмжээ, дүрсний descriptor, цагаан/хөх өмсгөлийн шинж **хамтдаа** болон гурван дараалсан тод кадр таарсан үед батална; бусад үед хэрэглэгч дахин сонгоно.
+Сонгосон track ID кадрт байхгүй бол эхлээд `uncertain`; 45 кадр батлагдахгүй өнгөрвөл `lost`. Box-ууд давхцсан ч ижил track ID, тогтвортой байрлал/хэмжээ, дүрсний шинж, цагаан өмсгөл болон хөх бус доод өмсгөлийн шинж **хамтдаа** нийцвэл tracking үргэлжилнэ. Эдгээр нотолгоо дутвал `Overlapping boxes; identity ambiguous`; хөх давамгайлсан эсвэл давхцлын дараа томорсон нэг box-ийг батлахгүй. Confidence сулрах, огцом байрлал/хэмжээ өөрчлөгдөх, өмсгөлийн шинж эсвэл grayscale дүрсний descriptor өөрчлөгдөх, camera cut илрэхэд мөн `uncertain`. Confidence 0.1–0.35 detection-ууд ByteTrack-д хэвээр очно, гэхдээ сул duplicate/body-part detection-ийг өөр хүн гэж үзэхгүй. Давхцлын дараах шинэ ID-г зөвхөн өмнөх байрлал, хөдөлгөөний таамаг, хэмжээ, дүрсний descriptor, дээд/доод өмсгөлийн шинж **хамтдаа** болон гурван дараалсан тод кадр таарсан үед батална; бусад үед хэрэглэгч дахин сонгоно.
 
 Эдгээр босго нь эхний хамгаалалт; жудогийн тэврэлт/барьц үед олон удаа uncertain болж болно. Camera cut нь жижигрүүлсэн хоёр кадрын дундаж ялгаагаар хэмжигдэх heuristic. Зөөлөн cut, detector хоёр хүнийг нэг box болгох, ижил өнгийн хүн нэг байрлалд орж ирэх зэрэг тохиолдолд tracker-ийн ID switch-ийг бүрэн илрүүлэх баталгаа байхгүй. Шинэ ID сэргээх нь дүрэмд суурилсан heuristic; сурсан ReID эсвэл pose identity баталгаажуулалт энэ шатанд байхгүй. Тайлангийн хөдөлгөөний шинжилгээнд ашиглахын өмнө бодит видео дээр хүний review шаардлагатай.
 
